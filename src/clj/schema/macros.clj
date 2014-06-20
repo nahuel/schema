@@ -1,6 +1,6 @@
 (ns schema.macros
   "Macros used in and provided by schema, separated out for Clojurescript's sake."
-  (:refer-clojure :exclude [defrecord fn defn letfn defmethod])
+  (:refer-clojure :exclude [defrecord fn defn letfn defmulti defmethod])
   (:require
    [clojure.data :as data]
    [clojure.string :as str]
@@ -70,6 +70,14 @@
 (defmacro validation-error [schema value expectation & [fail-explanation]]
   `(schema.utils/error
     (utils/->ValidationError ~schema ~value (delay ~expectation) ~fail-explanation)))
+
+(defmacro as2->
+  "Like as-> but also supports using destructuring expressions in name. Fix
+   proposed at http://dev.clojure.org/jira/browse/CLJ-1418"
+  [expr name & forms]
+  `(let [~name ~expr
+         ~@(interleave (repeat name) (butlast forms))]
+     ~(last forms)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Helpers for processing and normalizing element/argument schemas in s/defrecord and s/(de)fn
@@ -575,22 +583,136 @@
          ~@(when doc-string? [doc-string?])
          (schema.core/validate output-schema# ~init)))))
 
-(defmacro defmethod
-  "Like clojure.core/defmethod, except that schema-style typehints can be given on
-   the argument symbols and after the dispatch-val (for the return value).
 
-   See (doc schema.macros/defn) for details.
+
+(defmacro defmulti
+  "
+  Like clojure.core/defmulti, except you can define schema-style
+  typehints for all his defmethod's in a single place.
+
+  After using s/defmulti, you can add extra validation by declaring
+  schema hints in the s/defmethod calls, but the s/defmulti hints will
+  be always checked.
+
+  Examples:
+    (s/defmulti mymulti dispatch-fn :- s/Num [x :- s/Num y :- s/Num])
+
+    ;; Will validate by the defmulti signature:
+    (s/defmethod mymulti :dispatch-val1 [x y] (* * x y))                       
+
+    ;; Will validate by the defmulti signature first and, then by the
+    ;; defmethod one (more specialized). 
+    (s/defmethod mymulti :dispatch-val2 :- s/Int [x :- s/Int y :- s/Int] (* x y))
+
+    ;; If you need to use defmulti options simply put them at the end
+    (s/defmulti mymulti dispatch-fn :- s/Str [x :- s/Str y :- s/Str] :hierarchy myhierarchy)
+
+    ;; You can also define schema hinting for multiple arities (but all
+    ;; will share the same return value schema)
+    (s/defmulti mymulti dispatch-fn :- s/Str ([x :- s/Num y :- s/Num]
+                                              [x :- s/Num y :- s/Num z :- s/Str]))
+
+  Notes: 
+   - schemas will be checked after dispatch-fn runs
+  "
+  [mm-name & opts]
+  (as2-> [{} opts] [m [e & r :as o]] 
+         (if (string? e) 
+           [(assoc m :docstring [e]) r] 
+           [m o])
+         (if (map? e)
+           [(assoc m :attr-map e :dispatch-fn (first r)) (next r)]
+           [(assoc m             :dispatch-fn e)         r])
+         (if (= e :-)
+           [(assoc m :output (list :- (first r))) (next r)]
+           [m o])
+         (if-let [e (cond (list? e)   e
+                          (vector? e) (list e))]
+           [(assoc m :input e) r]
+           [m o])
+         (let [arglists          (:input m)
+               unhinted-arglists (for [args arglists]
+                                   (map #(with-meta % {}) (schema.macros/process-arrow-schematized-args {} args)))
+               has-variadic      (boolean (some (partial some #{'&}) arglists))
+               max-argcount      (reduce  #(max %1 (count (take-while (partial not= '&) %2)))
+                                          0
+                                          unhinted-arglists)
+               method-sym        (gensym 'method__)]
+
+           `(let [validator-fn# 
+                  (schema.macros/fn ~(with-meta (gensym 'defmulti-validator-fn__) (meta mm-name)) 
+                    ~@(:output m)
+                    ~@(for [[args unhinted-args] (partition 2 (interleave arglists unhinted-arglists))]
+                        `(~(into [method-sym] args) 
+                          (apply ~method-sym ~@unhinted-args)))
+                    ~@(when-not has-variadic
+                        (list (let [margs (take max-argcount (repeatedly (partial gensym 'arg__)))]
+                                `(~(vec (concat [method-sym] margs '[& rest])) 
+                                  (apply ~method-sym ~@margs ~'rest)))))
+                    )]
+
+              (clojure.core/defmulti ~mm-name
+                ~@(get m :docstring []) 
+                 ~(get m :attr-map  {})
+                 ~(get m :dispatch-fn) 
+                ~@o)
+
+              (if-cljs
+               (set! (.-schemavalidator ~mm-name) validator-fn#)
+               (let [defmulti-var# (ns-resolve '~(ns-name *ns*) '~mm-name)]
+                 (alter-meta! defmulti-var# assoc ::validator-fn validator-fn#)))
+              ))))
+
+
+(defmacro defmethod
+  "Like clojure.core/defmethod, except that schema-style typehints can
+   be given on the argument symbols and after the dispatch-val (for the
+   return value).
+
+   If you used s/defmulti for creating the multimethod, his schema
+   will be validated first and then the s/defmethod one. You can
+   override this behaviour by using the :ignore-defmulti-schema
+   metadata flag.
+
+   See (doc schema.macros/defn) and (doc schema.macros/defmulti) for
+   details.
 
    Examples:
-
      (s/defmethod mymultifun :a-dispatch-value :- s/Num [x :- s/Int y :- s/Num] (* x y))
 
      ;; You can also use meta tags like ^:always-validate by placing them
      ;; before the multifunction name:
-
      (s/defmethod ^:always-validate mymultifun :a-dispatch-value [x y] (* x y))
+
+     ;; Ignore s/defmulti schema, only check s/defmethod one. 
+     (s/defmethod ^:ignore-defmulti-schema ^:always-validate mymultifun :a-dispatch-value [x y] (* x y))
+
+   Notes: 
+    - s/defmethod schemas will be automatically validated if the
+     ^:always-validate flag is present in the s/defmethod
+      definition. s/defmulti flag only is considered for validation of
+      defmulti schema.
   "
-  [multifn dispatch-val & fn-tail]
-  `(if-cljs
-    (cljs.core/-add-method ~(with-meta multifn {:tag 'cljs.core/MultiFn}) ~dispatch-val (schema.macros/fn ~(with-meta (gensym) (meta multifn)) ~@fn-tail))
-    (. ~(with-meta multifn {:tag 'clojure.lang.MultiFn}) addMethod        ~dispatch-val (schema.macros/fn ~(with-meta (gensym) (meta multifn)) ~@fn-tail))))
+  [multifn dispatch-val & [f & _ :as fn-tail]]
+  (let [defmulti-validator-fn-sym (gensym 'defmulti-validator-fn__)
+        defmethod-preamble-exprs  {:cljs `(cljs.core/-add-method ~(with-meta multifn {:tag 'cljs.core/MultiFn}) ~dispatch-val)
+                                   :clj  `(. ~(with-meta multifn {:tag 'clojure.lang.MultiFn}) ~'addMethod      ~dispatch-val)}
+        method-fn-expr            `(schema.macros/fn ~(with-meta (gensym 'method-fn__) (meta multifn)) ~@fn-tail)
+        wrapped-method-fn-expr    `(clojure.core/fn [& ~'args]
+                                     (apply ~defmulti-validator-fn-sym ~method-fn-expr ~'args))
+        ]
+    `(if-let [~defmulti-validator-fn-sym 
+              ~(when-not (:ignore-defmulti-schema (meta multifn))
+                 `(if-cljs
+                   (.-schemavalidator ~multifn)
+                   (::validator-fn (meta (ns-resolve '~(ns-name *ns*) '~multifn)))))]
+       (if-cljs
+        ~(concat (:cljs defmethod-preamble-exprs) [wrapped-method-fn-expr])
+        ~(concat (:clj  defmethod-preamble-exprs) [wrapped-method-fn-expr]))
+       ;; defmulti validation function not available or user wants
+       ;; to ignore defmulti schema:
+       (if-cljs
+        ~(concat (:cljs defmethod-preamble-exprs) [method-fn-expr])
+        ~(concat (:clj  defmethod-preamble-exprs) [method-fn-expr]))
+       )))
+q
